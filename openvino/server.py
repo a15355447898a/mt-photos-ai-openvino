@@ -9,7 +9,6 @@ import numpy as np
 import cv2
 import asyncio
 from pydantic import BaseModel
-from rapidocr_openvino import RapidOCR
 from PIL import Image
 from io import BytesIO
 import insightface
@@ -17,6 +16,12 @@ from insightface.utils import storage
 from insightface.app import FaceAnalysis
 import logging
 import utils.clip as clip
+import openvino as ov
+from pathlib import Path
+import copy
+import math
+import utils.ocr_pre_post_processing as ocr_processing
+from queue import Queue
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -35,12 +40,25 @@ server_restart_time = int(os.getenv("SERVER_RESTART_TIME", "300"))
 env_auto_load_txt_modal = os.getenv("AUTO_LOAD_TXT_MODAL", "off") == "on" # 是否自动加载CLIP文本模型，开启可以优化第一次搜索时的响应速度,文本模型占用700多m内存
 
 restart_timer = None
-rapid_ocr = None
 clip_img_model = None
 clip_txt_model = None
 face_model = None
+face_model_lock = threading.Lock()
 
-face_analysis_device = os.getenv("DEVICE_TYPE", "GPU") #值：GPU || CPU ,指定使用核显还是CPU识别,默认GPU， 创建容器时，需要 --device /dev/dri:/dev/dri
+# OCR settings
+OCR_INFER_REQUESTS = 8  # Number of parallel inference requests for OCR
+ocr_device = os.getenv("OCR_DEVICE", "CPU")  # CPU or GPU
+det_model_file_path = Path("model/ch_PP-OCRv4_det_infer/inference.pdmodel")
+rec_model_file_path = Path("model/ch_PP-OCRv4_rec_infer/inference.pdmodel")
+ov_core = None
+det_compiled_model = None
+rec_compiled_model = None
+det_request_pool = None
+rec_request_pool = None
+postprocess_op = None
+
+
+face_analysis_device = "GPU" #值：GPU || CPU ,指定使用核显还是CPU识别,默认GPU， 创建容器时，需要 --device /dev/dri:/dev/dri
 detector_backend = os.getenv("DETECTOR_BACKEND", "insightface")
 recognition_model = os.getenv("RECOGNITION_MODEL", "buffalo_l")
 detection_thresh = float(os.getenv("DETECTION_THRESH", "0.65"))
@@ -57,9 +75,41 @@ class ClipTxtRequest(BaseModel):
     text: str
 
 def load_ocr_model():
-    global rapid_ocr
-    if rapid_ocr is None:
-        rapid_ocr = RapidOCR()
+    global ov_core, det_compiled_model, rec_compiled_model, postprocess_op, det_request_pool, rec_request_pool
+    if ov_core is None:
+        print(f"\n[INFO] Initializing OpenVINO OCR on device: {ocr_device}")
+        ov_core = ov.Core()
+        
+        # Text detection model
+        print(f"[INFO] Loading detection model: {det_model_file_path}")
+        det_model = ov_core.read_model(det_model_file_path)
+        det_compiled_model = ov_core.compile_model(det_model, device_name=ocr_device)
+        
+        # Create a pool of inference requests for the detection model
+        det_request_pool = Queue(maxsize=OCR_INFER_REQUESTS)
+        for _ in range(OCR_INFER_REQUESTS):
+            det_request_pool.put(det_compiled_model.create_infer_request())
+
+        # Text recognition model (dynamic width)
+        print(f"[INFO] Loading recognition model: {rec_model_file_path}")
+        rec_model = ov_core.read_model(rec_model_file_path)
+        for input_layer in rec_model.inputs:
+            shape = input_layer.partial_shape
+            shape[3] = -1  # Set width to dynamic
+            rec_model.reshape({input_layer: shape})
+        
+        rec_compiled_model = ov_core.compile_model(rec_model, device_name=ocr_device)
+
+        # Create a pool of inference requests for the recognition model
+        rec_request_pool = Queue(maxsize=OCR_INFER_REQUESTS)
+        for _ in range(OCR_INFER_REQUESTS):
+            rec_request_pool.put(rec_compiled_model.create_infer_request())
+
+        # Post-processing operator
+        ocr_processing.postprocess_params["character_dict_path"] = "fonts/ppocr_keys_v1.txt"
+        postprocess_op = ocr_processing.build_post_process(ocr_processing.postprocess_params)
+        print("[INFO] OCR models and request pools loaded successfully.")
+
 
 def load_clip_img_model():
     global clip_img_model
@@ -81,8 +131,11 @@ def load_face_model():
 
 @app.on_event("startup")
 async def startup_event():
-    if env_auto_load_txt_modal:
-        load_clip_txt_model()
+    # Load models on startup to avoid cold starts on first request
+    load_face_model()
+    load_clip_img_model()
+    load_ocr_model()
+    load_clip_txt_model()
 
 
 @app.middleware("http")
@@ -99,35 +152,170 @@ async def check_activity(request, call_next):
     return response
 
 async def verify_header(api_key: str = Header(...)):
-    # 在这里编写验证逻辑，例如检查 api_key 是否有效
     if api_key != api_auth_key:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return api_key
 
+async def predict(predict_func, *args):
+    """Helper to run blocking functions in a thread pool."""
+    return await asyncio.get_running_loop().run_in_executor(None, predict_func, *args)
 
-def to_fixed(num):
-    return str(round(num, 2))
+# --- OCR Helper Functions ---
 
+def _ocr_image_preprocess(input_image, size=640):
+    img = cv2.resize(input_image, (size, size))
+    img = np.transpose(img, [2, 0, 1]) / 255.0
+    img = np.expand_dims(img, 0)
+    img_mean = np.array([0.485, 0.456, 0.406]).reshape((3, 1, 1))
+    img_std = np.array([0.229, 0.224, 0.225]).reshape((3, 1, 1))
+    img = (img - img_mean) / img_std
+    return img.astype(np.float32)
 
-def trans_result(result):
-    texts = []
-    scores = []
-    boxes = []
-    if result is None:
-        return {'texts': texts, 'scores': scores, 'boxes': boxes}
-    for res_i in result:
-        dt_box = res_i[0]
-        box = {
-            'x': to_fixed(dt_box[0][0]),
-            'y': to_fixed(dt_box[0][1]),
-            'width': to_fixed(dt_box[1][0] - dt_box[0][0]),
-            'height': to_fixed(dt_box[2][1] - dt_box[0][1])
-        }
-        boxes.append(box)
-        texts.append(res_i[1])
-        scores.append(f"{res_i[2]:.2f}")
-    return {'texts': texts, 'scores': scores, 'boxes': boxes}
+def _ocr_resize_norm_img(img, max_wh_ratio):
+    rec_image_shape = [3, 48, 320]
+    imgC, imgH, imgW = rec_image_shape
+    assert imgC == img.shape[2]
 
+    if "ch" == "ch":
+        imgW = int(32 * max_wh_ratio)
+
+    h, w = img.shape[:2]
+    ratio = w / float(h)
+    if math.ceil(imgH * ratio) > imgW:
+        resized_w = imgW
+    else:
+        resized_w = int(math.ceil(imgH * ratio))
+
+    resized_image = cv2.resize(img, (resized_w, imgH))
+    resized_image = resized_image.astype("float32")
+    resized_image = resized_image.transpose((2, 0, 1)) / 255.0
+    resized_image = (resized_image - 0.5) / 0.5
+
+    padding_im = np.zeros((imgC, imgH, imgW), dtype=np.float32)
+    padding_im[:, :, 0:resized_w] = resized_image
+    return padding_im
+
+def _ocr_post_processing_detection(frame, det_results):
+    ori_im = frame.copy()
+    data = {"image": frame}
+    data_resize = ocr_processing.DetResizeForTest(data)
+    img, shape_list = data_resize["image"], data_resize["shape"]
+    shape_list = np.expand_dims(shape_list, axis=0)
+
+    pred = det_results[0]
+    segmentation = pred > 0.3
+    boxes_batch = []
+    for batch_index in range(pred.shape[0]):
+        src_h, src_w, ratio_h, ratio_w = shape_list[batch_index]
+        mask = segmentation[batch_index]
+        boxes, scores = ocr_processing.boxes_from_bitmap(
+            pred[batch_index], mask, src_w, src_h
+        )
+        boxes_batch.append({"points": boxes})
+
+    post_result = boxes_batch
+    dt_boxes = post_result[0]["points"]
+    dt_boxes = ocr_processing.filter_tag_det_res(dt_boxes, ori_im.shape)
+    return dt_boxes
+
+def _ocr_batch_text_box(img_crop_list, img_num, indices, beg_img_no, batch_num):
+    norm_img_batch = []
+    max_wh_ratio = 0
+    end_img_no = min(img_num, beg_img_no + batch_num)
+
+    for ino in range(beg_img_no, end_img_no):
+        h, w = img_crop_list[indices[ino]].shape[0:2]
+        wh_ratio = w * 1.0 / h
+        max_wh_ratio = max(max_wh_ratio, wh_ratio)
+
+    for ino in range(beg_img_no, end_img_no):
+        norm_img = _ocr_resize_norm_img(img_crop_list[indices[ino]], max_wh_ratio)
+        norm_img = norm_img[np.newaxis, :]
+        norm_img_batch.append(norm_img)
+
+    norm_img_batch = np.concatenate(norm_img_batch)
+    return norm_img_batch.copy()
+
+def _run_ocr_pipeline(image_bytes):
+    """Synchronous helper function containing the full OCR pipeline."""
+    det_request = None
+    rec_request = None
+    try:
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            return {'result': [], 'msg': 'Cannot decode image'}
+            
+        height, width, _ = frame.shape
+        if width > 10000 or height > 10000:
+            return {'result': [], 'msg': 'height or width out of range'}
+
+        # --- Start OCR Pipeline ---
+        test_image = _ocr_image_preprocess(frame, size=640)
+        
+        # Get a detection request from the pool and perform inference
+        det_request = det_request_pool.get()
+        det_results = det_request.infer([test_image])
+        det_request_pool.put(det_request)
+        det_request = None # Clear reference
+        
+        dt_boxes = _ocr_post_processing_detection(frame, det_results[det_compiled_model.output(0)])
+
+        if dt_boxes is None or len(dt_boxes) == 0:
+            return {"result": {"texts": [], "scores": [], "boxes": []}}
+
+        dt_boxes = ocr_processing.sorted_boxes(dt_boxes)
+
+        img_crop_list = [ocr_processing.get_rotate_crop_image(frame, box) for box in dt_boxes]
+        
+        img_num = len(img_crop_list)
+        width_list = [img.shape[1] / float(img.shape[0]) for img in img_crop_list]
+        indices = np.argsort(np.array(width_list))
+
+        batch_num = 6
+        rec_res = [["", 0.0]] * img_num
+        for beg_img_no in range(0, img_num, batch_num):
+            norm_img_batch = _ocr_batch_text_box(
+                img_crop_list, img_num, indices, beg_img_no, batch_num
+            )
+            
+            # Get a recognition request from the pool and perform inference
+            rec_request = rec_request_pool.get()
+            rec_results = rec_request.infer([norm_img_batch])
+            rec_request_pool.put(rec_request)
+            rec_request = None # Clear reference
+
+            rec_result = postprocess_op(rec_results[rec_compiled_model.output(0)])
+            for rno in range(len(rec_result)):
+                rec_res[indices[beg_img_no + rno]] = rec_result[rno]
+
+        texts = [str(r[0]) for r in rec_res]
+        scores = [f"{r[1]:.2f}" for r in rec_res]
+        
+        boxes_xywh = []
+        for box in dt_boxes:
+            box = np.array(box, dtype=np.float32)
+            x_min = float(np.min(box[:, 0]))
+            y_min = float(np.min(box[:, 1]))
+            width = float(np.max(box[:, 0]) - x_min)
+            height = float(np.max(box[:, 1]) - y_min)
+            boxes_xywh.append({
+                'x': f"{x_min:.1f}", 'y': f"{y_min:.1f}",
+                'width': f"{width:.1f}", 'height': f"{height:.1f}",
+            })
+
+        final_result = {"texts": texts, "scores": scores, "boxes": boxes_xywh}
+        return {'result': final_result}
+    except Exception as e:
+        logging.error("OCR Error: %s", e, exc_info=True)
+        return {'result': [], 'msg': str(e)}
+    finally:
+        # Ensure requests are returned to the pool even if an error occurs
+        if det_request is not None:
+            det_request_pool.put(det_request)
+        if rec_request is not None:
+            rec_request_pool.put(rec_request)
 
 @app.get("/", response_class=HTMLResponse)
 async def top_info():
@@ -174,32 +362,17 @@ async def check_req(api_key: str = Depends(verify_header)):
 
 @app.post("/ocr")
 async def process_image(file: UploadFile = File(...), api_key: str = Depends(verify_header)):
-    load_ocr_model()
     image_bytes = await file.read()
-    try:
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        height, width, _ = img.shape
-        if width > 10000 or height > 10000:
-            return {'result': [], 'msg': 'height or width out of range'}
-        _result = rapid_ocr(img)
-        result = trans_result(_result[0])
-        del img
-        del _result
-        return {'result': result}
-    except Exception as e:
-        print(e)
-        return {'result': [], 'msg': str(e)}
+    return await predict(_run_ocr_pipeline, image_bytes)
+
 
 @app.post("/clip/img")
 async def clip_process_image(file: UploadFile = File(...), api_key: str = Depends(verify_header)):
-    load_clip_img_model()
     image_bytes = await file.read()
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        # result = await predict(clip.process_image, img, clip_img_model)
-        result = clip.process_image(img, clip_img_model) # 避免 Infer Request is busy 错误
+        result = await predict(clip.process_image, img, clip_img_model)
         return {'result': ["{:.16f}".format(vec) for vec in result]}
     except Exception as e:
         print(e)
@@ -207,33 +380,28 @@ async def clip_process_image(file: UploadFile = File(...), api_key: str = Depend
 
 @app.post("/clip/txt")
 async def clip_process_txt(request:ClipTxtRequest, api_key: str = Depends(verify_header)):
-    load_clip_txt_model()
     text = request.text
-    # result = await predict(clip.process_txt, text, clip_txt_model)
-    result = clip.process_txt(text, clip_txt_model) # 避免 Infer Request is busy 错误
+    result = await predict(clip.process_txt, text, clip_txt_model)
     return {'result': ["{:.16f}".format(vec) for vec in result]}
-
 
 
 @app.post("/represent")
 async def process_image(file: UploadFile = File(...), api_key: str = Depends(verify_header)):
-    load_face_model()
     content_type = file.content_type
     image_bytes = await file.read()
     try:
         img = None
         if content_type == 'image/gif':
-            # Use Pillow to read the first frame of the GIF file
-            with Image.open(BytesIO(image_bytes)) as img:
-                if img.is_animated:
-                    img.seek(0)  # Seek to the first frame of the GIF
-                frame = img.convert('RGB')  # Convert to RGB mode
-                np_arr = np.array(frame)  # Convert to NumPy array
-                img = cv2.cvtColor(np_arr, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for OpenCV
+            with Image.open(BytesIO(image_bytes)) as img_pil:
+                if img_pil.is_animated:
+                    img_pil.seek(0)
+                frame = img_pil.convert('RGB')
+                np_arr = np.array(frame)
+                img = cv2.cvtColor(np_arr, cv2.COLOR_RGB2BGR)
         if img is None:
-            # Use OpenCV for other image types
             np_arr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
         if img is None:
             err = f"The uploaded file {file.filename} is not a valid image format or is corrupted."
             print(err)
@@ -243,20 +411,11 @@ async def process_image(file: UploadFile = File(...), api_key: str = Depends(ver
         if width > 10000 or height > 10000:
             return {'result': [], 'msg': 'height or width out of range'}
 
-        data = {"detector_backend": detector_backend, "recognition_model": recognition_model}
-
-        # embedding_objs = await predict(_represent, img)
-        embedding_objs = _represent(img)  # DmlExecutionProvider使用异步并发时会导致程序退出
-        del img
-        data["result"] = embedding_objs
-        # logging.info("detector_backend: %s", detector_backend)
-        # logging.info("recognition_model: %s", recognition_model)
-        logging.info("detected_img: %s", file.filename)
-        logging.info("img_type: %s", content_type)
-        logging.info("detected_persons: %d", len(embedding_objs))
-        for embedding_obj in embedding_objs:
-            logging.info("facial_area: %s", str(embedding_obj["facial_area"]))
-            logging.info("face_confidence: %f", embedding_obj["face_confidence"])
+        embedding_objs = await predict(_represent, img)
+        
+        data = {"detector_backend": detector_backend, "recognition_model": recognition_model, "result": embedding_objs}
+        
+        logging.info("detected_img: %s, detected_persons: %d", file.filename, len(embedding_objs))
         return data
     except Exception as e:
         if 'set enforce_detection' in str(e):
@@ -265,27 +424,20 @@ async def process_image(file: UploadFile = File(...), api_key: str = Depends(ver
         return {'result': [], 'msg': str(e)}
 
 def _represent(img):
-    faces = face_model.get(img)
+    with face_model_lock:
+        faces = face_model.get(img)
+    
     results = []
     for face in faces:
         resp_obj = {}
         embedding = face.normed_embedding.astype(float)
         resp_obj["embedding"] = embedding.tolist()
-        # print(len(resp_obj["embedding"]))
         box = face.bbox
         resp_obj["facial_area"] = {"x" : int(box[0]), "y" : int(box[1]), "w" : int(box[2] - box[0]), "h" : int(box[3] - box[1])}
         resp_obj["face_confidence"] = face.det_score.astype(float)
         results.append(resp_obj)
     return results
 
-
-async def predict(predict_func, inputs,model):
-    return await asyncio.get_running_loop().run_in_executor(None, predict_func, inputs,model)
-
 def restart_program():
     python = sys.executable
     os.execl(python, python, *sys.argv)
-
-
-if __name__ == "__main__":
-    uvicorn.run("server:app", host=None, port=http_port)

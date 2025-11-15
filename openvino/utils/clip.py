@@ -3,7 +3,7 @@ import sys
 import numpy as np
 from PIL import Image, ImageFile
 from typing import Union, List
-from openvino.runtime import Core
+from openvino import Core
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 current_folder = os.path.dirname(os.path.abspath(__file__))
@@ -77,7 +77,9 @@ def tokenize_numpy(texts: Union[str, List[str]], context_length: int = 52) -> np
 def load_img_model():
     core = Core()
     model_onnx = core.read_model(img_onnx_model_path)
-    return core.compile_model(model=model_onnx, device_name="AUTO")
+    return core.compile_model(
+        model=model_onnx, device_name="GPU", config={"PERFORMANCE_HINT": "THROUGHPUT"}
+    )
 
 def process_image(img, img_model):
     inputs = image_processor([img], image_size=IMG_SIZE)
@@ -88,7 +90,9 @@ def process_image(img, img_model):
 def load_txt_model():
     core = Core()
     model_onnx = core.read_model(txt_onnx_model_path)
-    return core.compile_model(model=model_onnx, device_name="AUTO")
+    return core.compile_model(
+        model=model_onnx, device_name="GPU", config={"PERFORMANCE_HINT": "THROUGHPUT"}
+    )
 
 
 def process_txt(txt, text_model):
