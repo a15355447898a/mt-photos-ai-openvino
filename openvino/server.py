@@ -49,7 +49,7 @@ clip_txt_request_pool = None
 face_model_pool = None
 
 # OCR settings
-OCR_INFER_REQUESTS = int(os.getenv("OCR_INFER_REQUESTS", "2"))  # Number of parallel inference requests for OCR
+OCR_INFER_REQUESTS = int(os.getenv("OCR_INFER_REQUESTS", "8"))  # Number of parallel inference requests for OCR
 ocr_device = os.getenv("OCR_DEVICE", "CPU")  # CPU or GPU
 det_model_file_path = Path("model/ch_PP-OCRv4_det_infer/inference.pdmodel")
 rec_model_file_path = Path("model/ch_PP-OCRv4_rec_infer/inference.pdmodel")
@@ -61,10 +61,13 @@ det_request_pool = None
 rec_request_pool = None
 postprocess_op = None
 
+# Face Recognition settings
+FACE_PARALLEL_INSTANCES = int(os.getenv("FACE_PARALLEL_INSTANCES", "2"))
+
+# Thread pool settings
 clip_workers = int(os.getenv("CLIP_WORKERS", "4"))
 ocr_workers = int(os.getenv("OCR_WORKERS", str(OCR_INFER_REQUESTS)))
-face_parallel_instances = max(1, int(os.getenv("FACE_PARALLEL_INSTANCES", "2")))
-face_workers = int(os.getenv("FACE_WORKERS", str(face_parallel_instances)))
+face_workers = int(os.getenv("FACE_WORKERS", str(FACE_PARALLEL_INSTANCES)))
 clip_img_infer_requests = max(1, int(os.getenv("CLIP_IMG_INFER_REQUESTS", str(clip_workers))))
 clip_txt_infer_requests = max(1, int(os.getenv("CLIP_TXT_INFER_REQUESTS", str(clip_workers))))
 
@@ -94,12 +97,12 @@ def load_ocr_model():
     if ov_core is None:
         print(f"\n[INFO] Initializing OpenVINO OCR on device: {ocr_device}")
         ov_core = ov.Core()
-        
+
         # Text detection model
         print(f"[INFO] Loading detection model: {det_model_file_path}")
         det_model = ov_core.read_model(det_model_file_path)
         det_compiled_model = ov_core.compile_model(det_model, device_name=ocr_device)
-        
+
         # Create a pool of inference requests for the detection model
         det_request_pool = Queue(maxsize=OCR_INFER_REQUESTS)
         for _ in range(OCR_INFER_REQUESTS):
@@ -113,7 +116,7 @@ def load_ocr_model():
                 shape = input_layer.partial_shape
                 shape[3] = -1  # Set width to dynamic
                 rec_model.reshape({input_layer: shape})
-        
+
         rec_compiled_model = ov_core.compile_model(rec_model, device_name=ocr_device)
 
         # Create a pool of inference requests for the recognition model
@@ -146,8 +149,9 @@ def load_clip_txt_model():
 def load_face_model():
     global face_model_pool
     if face_model_pool is None:
-        face_model_pool = Queue(maxsize=face_parallel_instances)
-        for _ in range(face_parallel_instances):
+        print(f"\n[INFO] Initializing {FACE_PARALLEL_INSTANCES} face model instances...")
+        face_model_pool = Queue(maxsize=FACE_PARALLEL_INSTANCES)
+        for _ in range(FACE_PARALLEL_INSTANCES):
             faceAnalysis = FaceAnalysis(
                 providers=["OpenVINOExecutionProvider"],
                 provider_options=[{"device_type": face_analysis_device, "precision": "FP32"}],
@@ -157,6 +161,7 @@ def load_face_model():
             )
             faceAnalysis.prepare(ctx_id=0, det_thresh=detection_thresh, det_size=(640, 640))
             face_model_pool.put(faceAnalysis)
+        print("[INFO] Face model pool loaded successfully.")
 
 
 @app.on_event("startup")
@@ -275,23 +280,23 @@ def _run_ocr_pipeline(image_bytes):
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+
         if frame is None:
             return {'result': [], 'msg': 'Cannot decode image'}
-            
+
         height, width, _ = frame.shape
         if width > 10000 or height > 10000:
             return {'result': [], 'msg': 'height or width out of range'}
 
         # --- Start OCR Pipeline ---
         test_image = _ocr_image_preprocess(frame, size=640)
-        
+
         # Get a detection request from the pool and perform inference
         det_request = det_request_pool.get()
         det_results = det_request.infer([test_image])
         det_request_pool.put(det_request)
         det_request = None # Clear reference
-        
+
         dt_boxes = _ocr_post_processing_detection(frame, det_results[det_compiled_model.output(0)])
 
         if dt_boxes is None or len(dt_boxes) == 0:
@@ -300,7 +305,7 @@ def _run_ocr_pipeline(image_bytes):
         dt_boxes = ocr_processing.sorted_boxes(dt_boxes)
 
         img_crop_list = [ocr_processing.get_rotate_crop_image(frame, box) for box in dt_boxes]
-        
+
         img_num = len(img_crop_list)
         width_list = [img.shape[1] / float(img.shape[0]) for img in img_crop_list]
         indices = np.argsort(np.array(width_list))
@@ -311,7 +316,7 @@ def _run_ocr_pipeline(image_bytes):
             norm_img_batch = _ocr_batch_text_box(
                 img_crop_list, img_num, indices, beg_img_no, batch_num
             )
-            
+
             # Get a recognition request from the pool and perform inference
             rec_request = rec_request_pool.get()
             rec_results = rec_request.infer([norm_img_batch])
@@ -324,7 +329,7 @@ def _run_ocr_pipeline(image_bytes):
 
         texts = [str(r[0]) for r in rec_res]
         scores = [f"{r[1]:.2f}" for r in rec_res]
-        
+
         boxes_xywh = []
         for box in dt_boxes:
             box = np.array(box, dtype=np.float32)
@@ -485,7 +490,7 @@ def _represent(img):
         faces = face_analysis.get(img)
     finally:
         face_model_pool.put(face_analysis)
-    
+
     results = []
     for face in faces:
         resp_obj = {}

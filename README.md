@@ -6,6 +6,8 @@
 
 > 适用于 Intel Arc GPU
 
+> 如果使用下面的docker-compose,请在mt-photos中把人脸识别,cli和ocr的并发全部改成8
+
 ## 最近更新
 
 - **引入了完善的多线程支持**：重构了服务架构，现在所有AI接口都能稳定、高效地并行处理多个请求。
@@ -38,7 +40,8 @@
 | `API_AUTH_KEY` | 用于访问API的认证密钥。 | `mt_photos_ai_extra` |
 | `WEB_CONCURRENCY` | Uvicorn服务启动的工作进程数，推荐设置为CPU核心数。 | `4` |
 | `OCR_DEVICE` | 指定OCR任务使用的计算设备。 | `CPU` |
-| `OCR_INFER_REQUESTS`| 每个工作进程为OCR创建的并行推理请求数。 | `2` |
+| `OCR_INFER_REQUESTS`| 每个工作进程为OCR创建的并行推理请求数。 | `8` |
+| `FACE_PARALLEL_INSTANCES` | 每个工作进程为人脸识别创建的模型实例数。 | `2` |
 | `HTTP_PORT` | 容器内服务监听的端口号。 | `8060` |
 
 
@@ -73,10 +76,8 @@ services:
       - "/dev/dri:/dev/dri"
     environment:
       - API_AUTH_KEY=your_secret_key_here
-      - WEB_CONCURRENCY=4
       - OCR_DEVICE=GPU
-      - OCR_INFER_REQUESTS=2
-      - HTTP_PORT=8060
+      - OCR_REC_DYNAMIC_WIDTH=off
     restart: unless-stopped
 ```
 
@@ -97,6 +98,7 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8060 (Press CTRL+C to quit)
 ```
 
+>
 
 ## API
 
