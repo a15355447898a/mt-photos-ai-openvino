@@ -98,7 +98,25 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8060 (Press CTRL+C to quit)
 ```
 
+>你可以用我预先构建的docker镜像
 >
+>```yaml
+>version: '3.8'
+>
+>services:
+>  mt-photos-ai:
+>    image: a15355447898a/mt-photos-ai-openvino:latest
+>    container_name: mt-photos-ai
+>    ports:
+>      - "8060:8060"
+>    devices:
+>      - "/dev/dri:/dev/dri"
+>    environment:
+>      - API_AUTH_KEY=your_secret_key_here
+>      - OCR_DEVICE=GPU
+>      - OCR_REC_DYNAMIC_WIDTH=off
+>    restart: unless-stopped
+>```
 
 ## API
 
