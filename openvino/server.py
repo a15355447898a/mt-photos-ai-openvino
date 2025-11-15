@@ -47,6 +47,7 @@ clip_txt_model = None
 clip_img_request_pool = None
 clip_txt_request_pool = None
 face_model_pool = None
+models_warmed = False
 
 # OCR settings
 OCR_INFER_REQUESTS = int(os.getenv("OCR_INFER_REQUESTS", "8"))  # Number of parallel inference requests for OCR
@@ -171,6 +172,7 @@ async def startup_event():
     load_clip_img_model()
     load_ocr_model()
     load_clip_txt_model()
+    await warmup_models()
 
 
 @app.middleware("http")
@@ -505,3 +507,32 @@ def _represent(img):
 def restart_program():
     python = sys.executable
     os.execl(python, python, *sys.argv)
+
+
+def _create_warmup_image_bytes(width=640, height=640):
+    """Create a dummy encoded image for warm-up."""
+    dummy_image = np.zeros((height, width, 3), dtype=np.uint8)
+    success, buffer = cv2.imencode(".png", dummy_image)
+    if not success:
+        raise RuntimeError("Failed to encode warm-up image.")
+    return buffer.tobytes()
+
+
+def _warmup_models_sync():
+    """Run one pass for every pipeline so workers are hot before serving traffic."""
+    dummy_bytes = _create_warmup_image_bytes()
+    _clip_img_pipeline(dummy_bytes)
+    _run_ocr_pipeline(dummy_bytes)
+    _run_represent_pipeline(dummy_bytes, "image/png", "warmup.png")
+    _clip_txt_pipeline("warmup text")
+
+
+async def warmup_models():
+    """Execute synchronous warm-up in a background thread."""
+    global models_warmed
+    if models_warmed:
+        return
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _warmup_models_sync)
+    models_warmed = True
+    print("[INFO] Model warm-up complete.")
