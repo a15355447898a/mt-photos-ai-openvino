@@ -2,6 +2,8 @@ from dotenv import load_dotenv
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from fastapi import Depends, FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.responses import HTMLResponse
 import uvicorn
@@ -42,20 +44,33 @@ env_auto_load_txt_modal = os.getenv("AUTO_LOAD_TXT_MODAL", "off") == "on" # 是�
 restart_timer = None
 clip_img_model = None
 clip_txt_model = None
-face_model = None
-face_model_lock = threading.Lock()
+clip_img_request_pool = None
+clip_txt_request_pool = None
+face_model_pool = None
 
 # OCR settings
-OCR_INFER_REQUESTS = 8  # Number of parallel inference requests for OCR
+OCR_INFER_REQUESTS = int(os.getenv("OCR_INFER_REQUESTS", "2"))  # Number of parallel inference requests for OCR
 ocr_device = os.getenv("OCR_DEVICE", "CPU")  # CPU or GPU
 det_model_file_path = Path("model/ch_PP-OCRv4_det_infer/inference.pdmodel")
 rec_model_file_path = Path("model/ch_PP-OCRv4_rec_infer/inference.pdmodel")
+ocr_rec_dynamic_width = os.getenv("OCR_REC_DYNAMIC_WIDTH", "on") == "on"
 ov_core = None
 det_compiled_model = None
 rec_compiled_model = None
 det_request_pool = None
 rec_request_pool = None
 postprocess_op = None
+
+clip_workers = int(os.getenv("CLIP_WORKERS", "4"))
+ocr_workers = int(os.getenv("OCR_WORKERS", str(OCR_INFER_REQUESTS)))
+face_parallel_instances = max(1, int(os.getenv("FACE_PARALLEL_INSTANCES", "2")))
+face_workers = int(os.getenv("FACE_WORKERS", str(face_parallel_instances)))
+clip_img_infer_requests = max(1, int(os.getenv("CLIP_IMG_INFER_REQUESTS", str(clip_workers))))
+clip_txt_infer_requests = max(1, int(os.getenv("CLIP_TXT_INFER_REQUESTS", str(clip_workers))))
+
+ocr_executor = ThreadPoolExecutor(max_workers=ocr_workers)
+clip_executor = ThreadPoolExecutor(max_workers=clip_workers)
+face_executor = ThreadPoolExecutor(max_workers=face_workers)
 
 
 face_analysis_device = "GPU" #值：GPU || CPU ,指定使用核显还是CPU识别,默认GPU， 创建容器时，需要 --device /dev/dri:/dev/dri
@@ -93,10 +108,11 @@ def load_ocr_model():
         # Text recognition model (dynamic width)
         print(f"[INFO] Loading recognition model: {rec_model_file_path}")
         rec_model = ov_core.read_model(rec_model_file_path)
-        for input_layer in rec_model.inputs:
-            shape = input_layer.partial_shape
-            shape[3] = -1  # Set width to dynamic
-            rec_model.reshape({input_layer: shape})
+        if ocr_rec_dynamic_width:
+            for input_layer in rec_model.inputs:
+                shape = input_layer.partial_shape
+                shape[3] = -1  # Set width to dynamic
+                rec_model.reshape({input_layer: shape})
         
         rec_compiled_model = ov_core.compile_model(rec_model, device_name=ocr_device)
 
@@ -112,21 +128,35 @@ def load_ocr_model():
 
 
 def load_clip_img_model():
-    global clip_img_model
+    global clip_img_model, clip_img_request_pool
     if clip_img_model is None:
         clip_img_model = clip.load_img_model()
+        clip_img_request_pool = Queue(maxsize=clip_img_infer_requests)
+        for _ in range(clip_img_infer_requests):
+            clip_img_request_pool.put(clip_img_model.create_infer_request())
 
 def load_clip_txt_model():
-    global clip_txt_model
+    global clip_txt_model, clip_txt_request_pool
     if clip_txt_model is None:
         clip_txt_model = clip.load_txt_model()
+        clip_txt_request_pool = Queue(maxsize=clip_txt_infer_requests)
+        for _ in range(clip_txt_infer_requests):
+            clip_txt_request_pool.put(clip_txt_model.create_infer_request())
 
 def load_face_model():
-    global face_model
-    if face_model is None:
-        faceAnalysis = FaceAnalysis(providers= ["OpenVINOExecutionProvider"],provider_options=[{"device_type": face_analysis_device, "precision": "FP32"}],root=model_folder_path, allowed_modules=['detection', 'recognition'], name=recognition_model)
-        faceAnalysis.prepare(ctx_id=0, det_thresh=detection_thresh, det_size=(640, 640))
-        face_model = faceAnalysis
+    global face_model_pool
+    if face_model_pool is None:
+        face_model_pool = Queue(maxsize=face_parallel_instances)
+        for _ in range(face_parallel_instances):
+            faceAnalysis = FaceAnalysis(
+                providers=["OpenVINOExecutionProvider"],
+                provider_options=[{"device_type": face_analysis_device, "precision": "FP32"}],
+                root=model_folder_path,
+                allowed_modules=['detection', 'recognition'],
+                name=recognition_model
+            )
+            faceAnalysis.prepare(ctx_id=0, det_thresh=detection_thresh, det_size=(640, 640))
+            face_model_pool.put(faceAnalysis)
 
 
 @app.on_event("startup")
@@ -156,9 +186,11 @@ async def verify_header(api_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return api_key
 
-async def predict(predict_func, *args):
-    """Helper to run blocking functions in a thread pool."""
-    return await asyncio.get_running_loop().run_in_executor(None, predict_func, *args)
+async def predict(predict_func, *args, executor=None):
+    """Helper to run blocking functions in dedicated thread pools."""
+    loop = asyncio.get_running_loop()
+    func = partial(predict_func, *args)
+    return await loop.run_in_executor(executor, func)
 
 # --- OCR Helper Functions ---
 
@@ -176,7 +208,7 @@ def _ocr_resize_norm_img(img, max_wh_ratio):
     imgC, imgH, imgW = rec_image_shape
     assert imgC == img.shape[2]
 
-    if "ch" == "ch":
+    if ocr_rec_dynamic_width and "ch" == "ch":
         imgW = int(32 * max_wh_ratio)
 
     h, w = img.shape[:2]
@@ -317,6 +349,70 @@ def _run_ocr_pipeline(image_bytes):
         if rec_request is not None:
             rec_request_pool.put(rec_request)
 
+def _decode_upload_image(image_bytes, content_type=None, filename=""):
+    """Decode upload bytes into a BGR OpenCV image."""
+    img = None
+    try:
+        if content_type == 'image/gif':
+            with Image.open(BytesIO(image_bytes)) as img_pil:
+                if img_pil.is_animated:
+                    img_pil.seek(0)
+                frame = img_pil.convert('RGB')
+                np_arr = np.array(frame)
+                img = cv2.cvtColor(np_arr, cv2.COLOR_RGB2BGR)
+        if img is None:
+            np_arr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    except Exception:
+        img = None
+
+    if img is None:
+        label = filename or "uploaded file"
+        raise ValueError(f"The uploaded file {label} is not a valid image format or is corrupted.")
+    return img
+
+def _clip_img_pipeline(image_bytes):
+    try:
+        img = _decode_upload_image(image_bytes)
+        infer_request = clip_img_request_pool.get()
+        try:
+            result = clip.process_image(img, clip_img_model, infer_request=infer_request)
+        finally:
+            clip_img_request_pool.put(infer_request)
+        return {'result': ["{:.16f}".format(vec) for vec in result]}
+    except Exception as e:
+        logging.error("CLIP image error: %s", e, exc_info=True)
+        return {'result': [], 'msg': str(e)}
+
+def _clip_txt_pipeline(text):
+    try:
+        infer_request = clip_txt_request_pool.get()
+        try:
+            result = clip.process_txt(text, clip_txt_model, infer_request=infer_request)
+        finally:
+            clip_txt_request_pool.put(infer_request)
+        return {'result': ["{:.16f}".format(vec) for vec in result]}
+    except Exception as e:
+        logging.error("CLIP text error: %s", e, exc_info=True)
+        return {'result': [], 'msg': str(e)}
+
+def _run_represent_pipeline(image_bytes, content_type, filename):
+    try:
+        img = _decode_upload_image(image_bytes, content_type, filename)
+        height, width, _ = img.shape
+        if width > 10000 or height > 10000:
+            return {'result': [], 'msg': 'height or width out of range'}
+
+        embedding_objs = _represent(img)
+        data = {"detector_backend": detector_backend, "recognition_model": recognition_model, "result": embedding_objs}
+        logging.info("detected_img: %s, detected_persons: %d", filename or "unknown", len(embedding_objs))
+        return data
+    except Exception as e:
+        if 'set enforce_detection' in str(e):
+            return {'result': []}
+        logging.error("Face representation error: %s", e, exc_info=True)
+        return {'result': [], 'msg': str(e)}
+
 @app.get("/", response_class=HTMLResponse)
 async def top_info():
     html_content = """<!DOCTYPE html>
@@ -363,69 +459,32 @@ async def check_req(api_key: str = Depends(verify_header)):
 @app.post("/ocr")
 async def process_image(file: UploadFile = File(...), api_key: str = Depends(verify_header)):
     image_bytes = await file.read()
-    return await predict(_run_ocr_pipeline, image_bytes)
+    return await predict(_run_ocr_pipeline, image_bytes, executor=ocr_executor)
 
 
 @app.post("/clip/img")
 async def clip_process_image(file: UploadFile = File(...), api_key: str = Depends(verify_header)):
     image_bytes = await file.read()
-    try:
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        result = await predict(clip.process_image, img, clip_img_model)
-        return {'result': ["{:.16f}".format(vec) for vec in result]}
-    except Exception as e:
-        print(e)
-        return {'result': [], 'msg': str(e)}
+    return await predict(_clip_img_pipeline, image_bytes, executor=clip_executor)
 
 @app.post("/clip/txt")
 async def clip_process_txt(request:ClipTxtRequest, api_key: str = Depends(verify_header)):
-    text = request.text
-    result = await predict(clip.process_txt, text, clip_txt_model)
-    return {'result': ["{:.16f}".format(vec) for vec in result]}
+    return await predict(_clip_txt_pipeline, request.text, executor=clip_executor)
 
 
 @app.post("/represent")
 async def process_image(file: UploadFile = File(...), api_key: str = Depends(verify_header)):
-    content_type = file.content_type
     image_bytes = await file.read()
-    try:
-        img = None
-        if content_type == 'image/gif':
-            with Image.open(BytesIO(image_bytes)) as img_pil:
-                if img_pil.is_animated:
-                    img_pil.seek(0)
-                frame = img_pil.convert('RGB')
-                np_arr = np.array(frame)
-                img = cv2.cvtColor(np_arr, cv2.COLOR_RGB2BGR)
-        if img is None:
-            np_arr = np.frombuffer(image_bytes, np.uint8)
-            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            err = f"The uploaded file {file.filename} is not a valid image format or is corrupted."
-            print(err)
-            return {'result': [], 'msg': str(err)}
-
-        height, width, _ = img.shape
-        if width > 10000 or height > 10000:
-            return {'result': [], 'msg': 'height or width out of range'}
-
-        embedding_objs = await predict(_represent, img)
-        
-        data = {"detector_backend": detector_backend, "recognition_model": recognition_model, "result": embedding_objs}
-        
-        logging.info("detected_img: %s, detected_persons: %d", file.filename, len(embedding_objs))
-        return data
-    except Exception as e:
-        if 'set enforce_detection' in str(e):
-            return {'result': []}
-        print(e)
-        return {'result': [], 'msg': str(e)}
+    return await predict(_run_represent_pipeline, image_bytes, file.content_type, file.filename, executor=face_executor)
 
 def _represent(img):
-    with face_model_lock:
-        faces = face_model.get(img)
+    if face_model_pool is None:
+        raise RuntimeError("Face model pool is not initialized.")
+    face_analysis = face_model_pool.get()
+    try:
+        faces = face_analysis.get(img)
+    finally:
+        face_model_pool.put(face_analysis)
     
     results = []
     for face in faces:

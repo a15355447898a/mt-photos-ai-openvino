@@ -81,10 +81,13 @@ def load_img_model():
         model=model_onnx, device_name="GPU", config={"PERFORMANCE_HINT": "THROUGHPUT"}
     )
 
-def process_image(img, img_model):
+def process_image(img, img_model, infer_request=None):
     inputs = image_processor([img], image_size=IMG_SIZE)
     input = inputs[0:1, :, :, :]
-    return img_model(input)[img_model.output(0)][0]
+    if infer_request is None:
+        return img_model(input)[img_model.output(0)][0]
+    infer_request.infer([input])
+    return infer_request.get_output_tensor(0).data[0]
 
 
 def load_txt_model():
@@ -95,6 +98,9 @@ def load_txt_model():
     )
 
 
-def process_txt(txt, text_model):
+def process_txt(txt, text_model, infer_request=None):
     input = tokenize_numpy([txt], 52)
-    return text_model(input)[text_model.output(0)][0]
+    if infer_request is None:
+        return text_model(input)[text_model.output(0)][0]
+    infer_request.infer([input])
+    return infer_request.get_output_tensor(0).data[0]
