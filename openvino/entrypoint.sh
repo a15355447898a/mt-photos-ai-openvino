@@ -10,4 +10,4 @@ echo "--- Model pre-loading complete. Starting Uvicorn server..."
 # 现在，用 exec 启动主应用。
 # exec 会让 Uvicorn 进程替换掉当前的 shell 进程，成为容器的主进程（PID 1），
 # 这样可以更好地处理信号。
-exec uvicorn server:app --host 0.0.0.0 --port ${HTTP_PORT:-8060} --workers ${WEB_CONCURRENCY:-4}
+exec uvicorn server:app --host 0.0.0.0 --port ${HTTP_PORT:-8060} --workers ${WEB_CONCURRENCY:-1}

@@ -40,6 +40,8 @@ api_auth_key = os.getenv("API_AUTH_KEY", "mt_photos_ai_extra")
 http_port = int(os.getenv("HTTP_PORT", "8060"))
 server_restart_time = int(os.getenv("SERVER_RESTART_TIME", "300"))
 env_auto_load_txt_modal = os.getenv("AUTO_LOAD_TXT_MODAL", "off") == "on" # 是否自动加载CLIP文本模型，开启可以优化第一次搜索时的响应速度,文本模型占用700多m内存
+web_concurrency = int(os.getenv("WEB_CONCURRENCY", "1"))
+enable_restart_timer = server_restart_time > 0 and web_concurrency == 1
 
 restart_timer = None
 clip_img_model = None
@@ -50,7 +52,6 @@ face_model_pool = None
 models_warmed = False
 
 # OCR settings
-OCR_INFER_REQUESTS = int(os.getenv("OCR_INFER_REQUESTS", "8"))  # Number of parallel inference requests for OCR
 ocr_device = os.getenv("OCR_DEVICE", "CPU")  # CPU or GPU
 det_model_file_path = Path("model/ch_PP-OCRv4_det_infer/inference.pdmodel")
 rec_model_file_path = Path("model/ch_PP-OCRv4_rec_infer/inference.pdmodel")
@@ -62,15 +63,12 @@ det_request_pool = None
 rec_request_pool = None
 postprocess_op = None
 
-# Face Recognition settings
-FACE_PARALLEL_INSTANCES = int(os.getenv("FACE_PARALLEL_INSTANCES", "2"))
-
 # Thread pool settings
-clip_workers = int(os.getenv("CLIP_WORKERS", "4"))
-ocr_workers = int(os.getenv("OCR_WORKERS", str(OCR_INFER_REQUESTS)))
-face_workers = int(os.getenv("FACE_WORKERS", str(FACE_PARALLEL_INSTANCES)))
-clip_img_infer_requests = max(1, int(os.getenv("CLIP_IMG_INFER_REQUESTS", str(clip_workers))))
-clip_txt_infer_requests = max(1, int(os.getenv("CLIP_TXT_INFER_REQUESTS", str(clip_workers))))
+clip_workers = max(1, int(os.getenv("CLIP_WORKERS", "8")))
+ocr_workers = int(os.getenv("OCR_WORKERS", "8"))
+face_workers = max(1, int(os.getenv("FACE_WORKERS", "8")))
+clip_img_infer_requests = clip_workers
+clip_txt_infer_requests = clip_workers
 
 ocr_executor = ThreadPoolExecutor(max_workers=ocr_workers)
 clip_executor = ThreadPoolExecutor(max_workers=clip_workers)
@@ -105,8 +103,8 @@ def load_ocr_model():
         det_compiled_model = ov_core.compile_model(det_model, device_name=ocr_device)
 
         # Create a pool of inference requests for the detection model
-        det_request_pool = Queue(maxsize=OCR_INFER_REQUESTS)
-        for _ in range(OCR_INFER_REQUESTS):
+        det_request_pool = Queue(maxsize=ocr_workers)
+        for _ in range(ocr_workers):
             det_request_pool.put(det_compiled_model.create_infer_request())
 
         # Text recognition model (dynamic width)
@@ -121,8 +119,8 @@ def load_ocr_model():
         rec_compiled_model = ov_core.compile_model(rec_model, device_name=ocr_device)
 
         # Create a pool of inference requests for the recognition model
-        rec_request_pool = Queue(maxsize=OCR_INFER_REQUESTS)
-        for _ in range(OCR_INFER_REQUESTS):
+        rec_request_pool = Queue(maxsize=ocr_workers)
+        for _ in range(ocr_workers):
             rec_request_pool.put(rec_compiled_model.create_infer_request())
 
         # Post-processing operator
@@ -150,9 +148,9 @@ def load_clip_txt_model():
 def load_face_model():
     global face_model_pool
     if face_model_pool is None:
-        print(f"\n[INFO] Initializing {FACE_PARALLEL_INSTANCES} face model instances...")
-        face_model_pool = Queue(maxsize=FACE_PARALLEL_INSTANCES)
-        for _ in range(FACE_PARALLEL_INSTANCES):
+        print(f"\n[INFO] Initializing {face_workers} face model instances...")
+        face_model_pool = Queue(maxsize=face_workers)
+        for _ in range(face_workers):
             faceAnalysis = FaceAnalysis(
                 providers=["OpenVINOExecutionProvider"],
                 provider_options=[{"device_type": face_analysis_device, "precision": "FP32"}],
@@ -179,11 +177,11 @@ async def startup_event():
 async def check_activity(request, call_next):
     global restart_timer
 
-    if restart_timer:
-        restart_timer.cancel()
-
-    restart_timer = threading.Timer(server_restart_time, restart_program)
-    restart_timer.start()
+    if enable_restart_timer:
+        if restart_timer:
+            restart_timer.cancel()
+        restart_timer = threading.Timer(server_restart_time, restart_program)
+        restart_timer.start()
 
     response = await call_next(request)
     return response
@@ -454,12 +452,15 @@ async def check_req(api_key: str = Depends(verify_header)):
 @app.post("/restart")
 async def check_req(api_key: str = Depends(verify_header)):
     # 客户端可调用，触发重启进程来释放内存
-    # restart_program()
+    if web_concurrency > 1:
+        return {'result': 'skipped', 'msg': 'WEB_CONCURRENCY>1 时禁用自动重启，避免端口冲突'}
     return {'result': 'pass'}
 
 @app.post("/restart_v2")
 async def check_req(api_key: str = Depends(verify_header)):
     # 预留触发服务重启接口-自动释放内存
+    if web_concurrency > 1:
+        return {'result': 'skipped', 'msg': 'WEB_CONCURRENCY>1 时禁用自动重启，避免端口冲突'}
     restart_program()
     return {'result': 'pass'}
 
@@ -505,6 +506,9 @@ def _represent(img):
     return results
 
 def restart_program():
+    if web_concurrency > 1:
+        logging.warning("Skip restart: WEB_CONCURRENCY>1 会导致多进程端口冲突。")
+        return
     python = sys.executable
     os.execl(python, python, *sys.argv)
 
