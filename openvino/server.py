@@ -33,6 +33,7 @@ logging.basicConfig(level=logging.WARNING)
 # print(f"Using device: {device}")
 
 on_linux = sys.platform.startswith('linux')
+project_root = Path(__file__).resolve().parent
 
 load_dotenv()
 app = FastAPI()
@@ -82,10 +83,15 @@ detection_thresh = float(os.getenv("DETECTION_THRESH", "0.65"))
 # 设置下载模型URL
 storage.BASE_REPO_URL = 'https://github.com/kqstone/mt-photos-insightface-unofficial/releases/download/models'
 on_win = sys.platform.startswith('win')
-model_folder_path = '~/.insightface'
-if on_win :
-    current_folder = os.path.dirname(os.path.abspath(__file__))
-    model_folder_path = os.path.join(current_folder, "_insightface_root")
+insightface_root_env = os.getenv("INSIGHTFACE_MODEL_ROOT")
+if insightface_root_env:
+    model_root_path = Path(insightface_root_env).expanduser()
+elif on_win:
+    model_root_path = project_root / "_insightface_root"
+else:
+    model_root_path = project_root / "insightface_models"
+model_root_path.mkdir(parents=True, exist_ok=True)
+model_folder_path = str(model_root_path)
 
 
 class ClipTxtRequest(BaseModel):

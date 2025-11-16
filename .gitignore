@@ -1,5 +1,4 @@
-openvino/model/*
-onnx/*/*.onnx
+openvino/insightface_models/models/buffalo_l/*.onnx
 openvino/utils/*.onnx
 .env
 .idea/

@@ -24,6 +24,9 @@ WORKDIR /app
 # Copy the requirements file first to leverage Docker layer caching
 COPY requirements.txt .
 
+# Pre-create insightface model directory so local weights can be used directly
+RUN mkdir -p /app/insightface_models/models
+
 # Install build dependencies, Python packages, and then remove build dependencies in a single layer
 # This minimizes image size and avoids "no space left on device" errors during build.
 RUN apt-get update && \
@@ -38,6 +41,7 @@ COPY . .
 # Set environment variables
 ENV NO_ALBUMENTATIONS_UPDATE=1
 ENV API_AUTH_KEY=mt_photos_ai_extra
+ENV INSIGHTFACE_MODEL_ROOT=/app/insightface_models
 
 # Expose the port the app runs on
 EXPOSE 8060

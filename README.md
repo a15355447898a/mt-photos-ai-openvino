@@ -10,9 +10,11 @@
 
 ## 最近更新
 
-- **支持全部服务的Intel GPU加速**
-- **引入了完善的多线程支持**：重构了服务架构，现在所有AI接口都能稳定、高效地并行处理多个请求。
-- **提升了可配置性**：新增了 `WEB_CONCURRENCY` 环境变量，可以根据服务器性能自由调整并发的工作进程数量。新增了 `OCR_WORKERS` `CLIP_WORKERS` `FACE_WORKERS` ，可以自己设置线程池。同时，OCR任务的计算设备（`OCR_DEVICE`）和内部模型是否设置为动态（`OCR_REC_DYNAMIC_WIDTH`）也可通过环境变量灵活切换。
+> * 2025/11/16
+>   * **支持全部服务的Intel GPU加速**: 人脸识别，OCR和CLI全部支持OpenVINO的GPU加速。
+>   * **引入了完善的多线程支持**：重构了服务架构，现在所有AI接口都能稳定、高效地并行处理多个请求。
+>   * **提升了可配置性**：新增了 `WEB_CONCURRENCY` 环境变量，可以根据服务器性能自由调整并发的工作进程数量。新增了 `OCR_WORKERS` `CLIP_WORKERS` `FACE_WORKERS` ，可以自己设置线程池。同时，OCR任务的计算设备（`OCR_DEVICE`）和内部模型是否设置为动态（`OCR_REC_DYNAMIC_WIDTH`）也可通过环境变量灵活切换。
+>   * **所有需要的模型已经打包进镜像**: 运行docker容器无须等待模型下载。
 
 ## 配置选项 (环境变量)
 
@@ -61,14 +63,28 @@
 
 ## Docker Compose 部署指南
 
-### 1. 准备工作：下载CLIP模型
+### 1. 准备工作：下载模型
+
+#### 1.1 CLI模型下载
 
 在构建镜像前，你需要手动下载两个CLIP模型文件，并将它们放置在 `openvino/utils/` 目录下。
 
 - `vit-b-16.img.fp32.onnx`
 - `vit-b-16.txt.fp32.onnx`
 
-**下载链接**: https://github.com/MT-Photos/mt-photos-ai/releases/tag/v1.1.0
+**下载链接**: https://github.com/a15355447898a/mt-photos-ai-openvino/releases/tag/0.1
+
+#### 1.2 人脸识别模型下载
+
+在构建镜像前，你需要手动下载五个人脸识别模型文件，并将它们放置在 `openvino/insightface_models/models/buffalo_l/` 目录下。
+
+* `w600k_r50.onnx`
+* `genderage.onnx`
+* `det_10g.onnx`
+* `2d106det.onnx`
+* `1k3d68.onnx`
+
+**下载链接**: https://github.com/a15355447898a/mt-photos-ai-openvino/releases/tag/0.2
 
 ### 2. 创建并运行服务
 
