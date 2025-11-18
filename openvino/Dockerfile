@@ -15,7 +15,8 @@ RUN apt-get update && \
     libxrender1 \
     libfontconfig1 \
     libgomp1 \
-    ccache && \
+    ccache \
+    supervisor && \
     rm -rf /var/lib/apt/lists/*
 
 # Set the working directory in the container
@@ -26,6 +27,8 @@ COPY requirements.txt .
 
 # Pre-create insightface model directory so local weights can be used directly
 RUN mkdir -p /app/insightface_models/models
+# Pre-create log directory for supervisor
+RUN mkdir -p /var/log/supervisor
 
 # Install build dependencies, Python packages, and then remove build dependencies in a single layer
 # This minimizes image size and avoids "no space left on device" errors during build.
@@ -37,6 +40,12 @@ RUN apt-get update && \
 
 # Copy the rest of the application code, including server.py, utils, models, and fonts
 COPY . .
+
+# Copy supervisor config
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Grant execution permissions
+RUN chmod +x /app/entrypoint.sh && chmod +x /app/watchdog.sh
 
 # Set environment variables
 ENV NO_ALBUMENTATIONS_UPDATE=1

@@ -10,6 +10,8 @@
 
 ## 最近更新
 
+> * 2025/11/18
+>   * 实现多`WEB_CONCURRENCY`情况下的休眠 未打包镜像测试 README的说明也没改
 > * 2025/11/16
 >   * **支持全部服务的Intel GPU加速**: 人脸识别，OCR和CLI全部支持OpenVINO的GPU加速。
 >   * **引入了完善的多线程支持**：重构了服务架构，现在所有AI接口都能稳定、高效地并行处理多个请求。
@@ -18,17 +20,16 @@
 
 ## 配置选项 (环境变量)
 
-| 环境变量 | 功能说明 | 默认值 |
-| :--- | :--- | :--- |
-| `API_AUTH_KEY` | 用于访问API的认证密钥。 | `mt_photos_ai_extra` |
-| `WEB_CONCURRENCY` | Uvicorn服务启动的工作进程数，一般保持为 1，需要更高吞吐且不依赖休眠时再调大。 | `1` |
-| `OCR_DEVICE` | 指定OCR任务使用的计算设备。 | `CPU` |
-| `OCR_REC_DYNAMIC_WIDTH` | 是否启用动态宽度（on=动态宽度，off=静态宽度）。 | `on` |
-| `OCR_WORKERS` | OCR 线程池大小，同时也是每个工作进程为OCR创建的推理请求数量。 | `8` |
-| `CLIP_WORKERS` | CLIP 图像/文本共用的线程池与推理请求数量。 | `8` |
-| `FACE_WORKERS` | 人脸识别线程池大小，同时决定要预创建的 `FaceAnalysis` 实例数。 | `8` |
-| `HTTP_PORT` | 容器内服务监听的端口号。 | `8060` |
-
+| 环境变量                  | 功能说明                                                                      | 默认值                 |
+| :------------------------ | :---------------------------------------------------------------------------- | :--------------------- |
+| `API_AUTH_KEY`          | 用于访问API的认证密钥。                                                       | `mt_photos_ai_extra` |
+| `WEB_CONCURRENCY`       | Uvicorn服务启动的工作进程数，一般保持为 1，需要更高吞吐且不依赖休眠时再调大。 | `1`                  |
+| `OCR_DEVICE`            | 指定OCR任务使用的计算设备。                                                   | `CPU`                |
+| `OCR_REC_DYNAMIC_WIDTH` | 是否启用动态宽度（on=动态宽度，off=静态宽度）。                               | `on`                 |
+| `OCR_WORKERS`           | OCR 线程池大小，同时也是每个工作进程为OCR创建的推理请求数量。                 | `8`                  |
+| `CLIP_WORKERS`          | CLIP 图像/文本共用的线程池与推理请求数量。                                    | `8`                  |
+| `FACE_WORKERS`          | 人脸识别线程池大小，同时决定要预创建的 `FaceAnalysis` 实例数。              | `8`                  |
+| `HTTP_PORT`             | 容器内服务监听的端口号。                                                      | `8060`               |
 
 ### 并发配置建议
 
@@ -54,12 +55,12 @@
 
 实测表现（以Arc独显为例）：
 
-| 设备+模式        | 速度 | 精度表现 |
-|-----------------|------|----------|
-| GPU + 静态宽度  | 非常快 | 个别不存在的字会误检 |
-| GPU + 动态宽度  | 非常慢 | 精度略高，误检减少 |
-| CPU + 动态宽度  | 较快  | 精度最高，长文本也能稳定识别 |
-| CPU + 静态宽度  | 略快于上者 | 精度与 CPU+动态 持平 |
+| 设备+模式      | 速度       | 精度表现                     |
+| -------------- | ---------- | ---------------------------- |
+| GPU + 静态宽度 | 非常快     | 个别不存在的字会误检         |
+| GPU + 动态宽度 | 非常慢     | 精度略高，误检减少           |
+| CPU + 动态宽度 | 较快       | 精度最高，长文本也能稳定识别 |
+| CPU + 静态宽度 | 略快于上者 | 精度与 CPU+动态 持平         |
 
 ## Docker Compose 部署指南
 
@@ -116,11 +117,12 @@ services:
 ```bash
 docker-compose up --build -d
 ```
+
 - `--build` 参数会确保在启动前（重新）构建镜像。
 - `-d` 参数使服务在后台运行。
 
-
 看到以下日志，则说明服务已经启动成功
+
 ```bash
 INFO:     Started server process [3024]
 INFO:     Waiting for application startup.
@@ -128,12 +130,12 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8060 (Press CTRL+C to quit)
 ```
 
->你可以用我预先构建的docker镜像
+> 你可以用我预先构建的docker镜像
 >
->```yaml
->version: '3.8'
+> ```yaml
+> version: '3.8'
 >
->services:
+> services:
 >  mt-photos-ai:
 >    image: a15355447898a/mt-photos-ai-openvino:latest
 >    container_name: mt-photos-ai
@@ -146,7 +148,7 @@ INFO:     Uvicorn running on http://0.0.0.0:8060 (Press CTRL+C to quit)
 >      - OCR_DEVICE=GPU
 >      - OCR_REC_DYNAMIC_WIDTH=off
 >    restart: unless-stopped
->```
+> ```
 
 ## API
 
@@ -209,7 +211,6 @@ curl --location --request POST 'http://127.0.0.1:8060/ocr' \
   }
 }
 ```
-
 
 ### /clip/img
 

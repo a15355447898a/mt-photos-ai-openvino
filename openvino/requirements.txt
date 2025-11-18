@@ -11,3 +11,4 @@ shapely
 pyclipper
 onnxruntime-openvino
 openvino
+gunicorn

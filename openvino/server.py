@@ -34,23 +34,22 @@ logging.basicConfig(level=logging.WARNING)
 
 on_linux = sys.platform.startswith('linux')
 project_root = Path(__file__).resolve().parent
+HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "/tmp/mt_photos_ai.heartbeat"))
+
 
 load_dotenv()
 app = FastAPI()
 api_auth_key = os.getenv("API_AUTH_KEY", "mt_photos_ai_extra")
 http_port = int(os.getenv("HTTP_PORT", "8060"))
-server_restart_time = int(os.getenv("SERVER_RESTART_TIME", "300"))
-env_auto_load_txt_modal = os.getenv("AUTO_LOAD_TXT_MODAL", "off") == "on" # 是否自动加载CLIP文本模型，开启可以优化第一次搜索时的响应速度,文本模型占用700多m内存
 web_concurrency = int(os.getenv("WEB_CONCURRENCY", "1"))
-enable_restart_timer = server_restart_time > 0 and web_concurrency == 1
 
-restart_timer = None
 clip_img_model = None
 clip_txt_model = None
 clip_img_request_pool = None
 clip_txt_request_pool = None
 face_model_pool = None
 models_warmed = False
+
 
 # OCR settings
 ocr_device = os.getenv("OCR_DEVICE", "CPU")  # CPU or GPU
@@ -180,15 +179,9 @@ async def startup_event():
 
 
 @app.middleware("http")
-async def check_activity(request, call_next):
-    global restart_timer
-
-    if enable_restart_timer:
-        if restart_timer:
-            restart_timer.cancel()
-        restart_timer = threading.Timer(server_restart_time, restart_program)
-        restart_timer.start()
-
+async def update_heartbeat(request, call_next):
+    """Updates a heartbeat file on every request to mark the service as active."""
+    HEARTBEAT_FILE.touch()
     response = await call_next(request)
     return response
 
@@ -456,19 +449,45 @@ async def check_req(api_key: str = Depends(verify_header)):
 
 
 @app.post("/restart")
-async def check_req(api_key: str = Depends(verify_header)):
-    # 客户端可调用，触发重启进程来释放内存
-    if web_concurrency > 1:
-        return {'result': 'skipped', 'msg': 'WEB_CONCURRENCY>1 时禁用自动重启，避免端口冲突'}
-    return {'result': 'pass'}
+async def restart_req(api_key: str = Depends(verify_header)):
+    return {'result': 'disabled', 'msg': 'Manual restart is disabled in multi-process mode.'}
+
+import signal
+
+# ... (other imports)
 
 @app.post("/restart_v2")
-async def check_req(api_key: str = Depends(verify_header)):
-    # 预留触发服务重启接口-自动释放内存
-    if web_concurrency > 1:
-        return {'result': 'skipped', 'msg': 'WEB_CONCURRENCY>1 时禁用自动重启，避免端口冲突'}
-    restart_program()
-    return {'result': 'pass'}
+async def trigger_restart(api_key: str = Depends(verify_header)):
+    """
+    Triggers a graceful restart of all Gunicorn worker processes.
+    This is achieved by sending a SIGHUP signal to the Gunicorn master process.
+    """
+    gunicorn_pid_file = Path("/tmp/gunicorn.pid")
+    
+    if not gunicorn_pid_file.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="Gunicorn PID file not found. The server might not be running under Gunicorn.",
+        )
+    
+    try:
+        pid_str = gunicorn_pid_file.read_text().strip()
+        gunicorn_pid = int(pid_str)
+        
+        logging.info(f"Manual restart triggered. Sending SIGHUP to Gunicorn master (PID: {gunicorn_pid}).")
+        os.kill(gunicorn_pid, signal.SIGHUP)
+        
+        # After sending the signal, also touch the heartbeat file to reset the watchdog timer
+        HEARTBEAT_FILE.touch()
+        
+        return {"result": "success", "msg": f"SIGHUP signal sent to Gunicorn master process (PID: {gunicorn_pid}). Workers are restarting."}
+    except Exception as e:
+        logging.error(f"Failed to trigger restart: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while trying to send restart signal: {e}",
+        )
+
 
 @app.post("/ocr")
 async def process_image(file: UploadFile = File(...), api_key: str = Depends(verify_header)):
@@ -510,14 +529,6 @@ def _represent(img):
         resp_obj["face_confidence"] = face.det_score.astype(float)
         results.append(resp_obj)
     return results
-
-def restart_program():
-    if web_concurrency > 1:
-        logging.warning("Skip restart: WEB_CONCURRENCY>1 会导致多进程端口冲突。")
-        return
-    python = sys.executable
-    os.execl(python, python, *sys.argv)
-
 
 def _create_warmup_image_bytes(width=640, height=640):
     """Create a dummy encoded image for warm-up."""
