@@ -17,6 +17,7 @@ import insightface
 from insightface.utils import storage
 from insightface.app import FaceAnalysis
 import logging
+import time
 import utils.clip as clip
 import openvino as ov
 from pathlib import Path
@@ -26,6 +27,14 @@ import utils.ocr_pre_post_processing as ocr_processing
 from queue import Queue
 
 logging.basicConfig(level=logging.WARNING)
+request_logger = logging.getLogger("mt_photos_ai.request")
+if not request_logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    request_logger.addHandler(handler)
+request_logger.setLevel(logging.INFO)
+request_logger.propagate = False
 
 
 # import onnxruntime as ort
@@ -184,7 +193,31 @@ async def startup_event():
 async def update_heartbeat(request, call_next):
     """Updates a heartbeat file on every request to mark the service as active."""
     HEARTBEAT_FILE.touch()
-    response = await call_next(request)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.perf_counter() - start) * 1000
+        client_host = request.client.host if request.client else "-"
+        request_logger.info(
+            "%s %s %s %d %.1fms",
+            client_host,
+            request.method,
+            request.url.path,
+            500,
+            duration_ms,
+        )
+        raise
+    duration_ms = (time.perf_counter() - start) * 1000
+    client_host = request.client.host if request.client else "-"
+    request_logger.info(
+        "%s %s %s %d %.1fms",
+        client_host,
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
     return response
 
 async def verify_header(api_key: str = Header(...)):
