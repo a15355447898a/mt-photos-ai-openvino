@@ -10,5 +10,5 @@ paddlepaddle
 shapely
 pyclipper
 onnxruntime-openvino
-openvino
+openvino==2025.4.1
 gunicorn

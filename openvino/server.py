@@ -52,16 +52,22 @@ models_warmed = False
 
 
 # OCR settings
-ocr_device = os.getenv("OCR_DEVICE", "CPU")  # CPU or GPU
+ocr_device = "GPU"
 det_model_file_path = Path("model/ch_PP-OCRv4_det_infer/inference.pdmodel")
 rec_model_file_path = Path("model/ch_PP-OCRv4_rec_infer/inference.pdmodel")
-ocr_rec_dynamic_width = os.getenv("OCR_REC_DYNAMIC_WIDTH", "on") == "on"
 ov_core = None
 det_compiled_model = None
 rec_compiled_model = None
 det_request_pool = None
 rec_request_pool = None
 postprocess_op = None
+
+def _get_ocr_compile_config():
+    try:
+        precision_hint = ov.properties.hint.inference_precision
+    except AttributeError:
+        precision_hint = "INFERENCE_PRECISION_HINT"
+    return {precision_hint: ov.Type.f32}
 
 # Thread pool settings
 clip_workers = max(1, int(os.getenv("CLIP_WORKERS", "8")))
@@ -101,27 +107,23 @@ def load_ocr_model():
     if ov_core is None:
         print(f"\n[INFO] Initializing OpenVINO OCR on device: {ocr_device}")
         ov_core = ov.Core()
+        compile_config = _get_ocr_compile_config()
 
         # Text detection model
         print(f"[INFO] Loading detection model: {det_model_file_path}")
         det_model = ov_core.read_model(det_model_file_path)
-        det_compiled_model = ov_core.compile_model(det_model, device_name=ocr_device)
+        det_compiled_model = ov_core.compile_model(det_model, device_name=ocr_device, config=compile_config)
 
         # Create a pool of inference requests for the detection model
         det_request_pool = Queue(maxsize=ocr_workers)
         for _ in range(ocr_workers):
             det_request_pool.put(det_compiled_model.create_infer_request())
 
-        # Text recognition model (dynamic width)
+        # Text recognition model (static width)
         print(f"[INFO] Loading recognition model: {rec_model_file_path}")
         rec_model = ov_core.read_model(rec_model_file_path)
-        if ocr_rec_dynamic_width:
-            for input_layer in rec_model.inputs:
-                shape = input_layer.partial_shape
-                shape[3] = -1  # Set width to dynamic
-                rec_model.reshape({input_layer: shape})
 
-        rec_compiled_model = ov_core.compile_model(rec_model, device_name=ocr_device)
+        rec_compiled_model = ov_core.compile_model(rec_model, device_name=ocr_device, config=compile_config)
 
         # Create a pool of inference requests for the recognition model
         rec_request_pool = Queue(maxsize=ocr_workers)
@@ -211,9 +213,6 @@ def _ocr_resize_norm_img(img, max_wh_ratio):
     rec_image_shape = [3, 48, 320]
     imgC, imgH, imgW = rec_image_shape
     assert imgC == img.shape[2]
-
-    if ocr_rec_dynamic_width and "ch" == "ch":
-        imgW = int(32 * max_wh_ratio)
 
     h, w = img.shape[:2]
     ratio = w / float(h)

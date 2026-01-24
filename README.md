@@ -15,7 +15,7 @@
 > * 2025/11/16
 >   * **支持全部服务的Intel GPU加速**: 人脸识别，OCR和CLI全部支持OpenVINO的GPU加速。
 >   * **引入了完善的多线程支持**：重构了服务架构，现在所有AI接口都能稳定、高效地并行处理多个请求。
->   * **提升了可配置性**：新增了 `WEB_CONCURRENCY` 环境变量，可以根据服务器性能自由调整并发的工作进程数量。新增了 `OCR_WORKERS` `CLIP_WORKERS` `FACE_WORKERS` ，可以自己设置线程池。同时，OCR任务的计算设备（`OCR_DEVICE`）和内部模型是否设置为动态（`OCR_REC_DYNAMIC_WIDTH`）也可通过环境变量灵活切换。
+>   * **提升了可配置性**：新增了 `WEB_CONCURRENCY` 环境变量，可以根据服务器性能自由调整并发的工作进程数量。新增了 `OCR_WORKERS` `CLIP_WORKERS` `FACE_WORKERS` ，可以自己设置线程池。
 >   * **所有需要的模型已经打包进镜像**: 运行docker容器无须等待模型下载。
 
 ## 配置选项 (环境变量)
@@ -24,8 +24,6 @@
 | :------------------------ | :---------------------------------------------------------------------------- | :--------------------- |
 | `API_AUTH_KEY`          | 用于访问API的认证密钥。                                                       | `mt_photos_ai_extra` |
 | `WEB_CONCURRENCY`       | Uvicorn服务启动的工作进程数，一般保持为 1，需要更高吞吐且不依赖休眠时再调大。 | `1`                  |
-| `OCR_DEVICE`            | 指定OCR任务使用的计算设备。                                                   | `CPU`                |
-| `OCR_REC_DYNAMIC_WIDTH` | 是否启用动态宽度（on=动态宽度，off=静态宽度）。                               | `on`                 |
 | `OCR_WORKERS`           | OCR 线程池大小，同时也是每个工作进程为OCR创建的推理请求数量。                 | `8`                  |
 | `CLIP_WORKERS`          | CLIP 图像/文本共用的线程池与推理请求数量。                                    | `8`                  |
 | `FACE_WORKERS`          | 人脸识别线程池大小，同时决定要预创建的 `FaceAnalysis` 实例数。              | `8`                  |
@@ -43,24 +41,6 @@
 ```
 
 只有在需要更高吞吐并能接受额外显存/内存占用时，再考虑把 `WEB_CONCURRENCY` 拉高(会破坏休眠)。
-
-### OCR 模式配置建议
-
-使用下方环境变量控制识别分支：
-
-```bash
-- OCR_REC_DYNAMIC_WIDTH=off    # on=动态宽度，off=静态宽度
-- OCR_DEVICE=GPU              # CPU 或 GPU
-```
-
-实测表现（以Arc独显为例）：
-
-| 设备+模式      | 速度       | 精度表现                     |
-| -------------- | ---------- | ---------------------------- |
-| GPU + 静态宽度 | 非常快     | 个别不存在的字会误检         |
-| GPU + 动态宽度 | 非常慢     | 精度略高，误检减少           |
-| CPU + 动态宽度 | 较快       | 精度最高，长文本也能稳定识别 |
-| CPU + 静态宽度 | 略快于上者 | 精度与 CPU+动态 持平         |
 
 ## Docker Compose 部署指南
 
@@ -107,8 +87,6 @@ services:
       - "/dev/dri:/dev/dri"
     environment:
       - API_AUTH_KEY=your_secret_key_here
-      - OCR_DEVICE=GPU
-      - OCR_REC_DYNAMIC_WIDTH=off
     restart: unless-stopped
 ```
 
@@ -145,8 +123,6 @@ INFO:     Uvicorn running on http://0.0.0.0:8060 (Press CTRL+C to quit)
 >      - "/dev/dri:/dev/dri"
 >    environment:
 >      - API_AUTH_KEY=your_secret_key_here
->      - OCR_DEVICE=GPU
->      - OCR_REC_DYNAMIC_WIDTH=off
 >    restart: unless-stopped
 > ```
 

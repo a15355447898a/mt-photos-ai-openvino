@@ -1,5 +1,5 @@
 # Use the official OpenVINO runtime image as a parent image
-FROM openvino/ubuntu22_runtime:latest
+FROM openvino/ubuntu22_runtime:2025.4.1
 USER root
 
 # Set up APT sources for faster downloads
