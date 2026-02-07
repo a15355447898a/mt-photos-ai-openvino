@@ -6,7 +6,7 @@
 
 > 适用于 Intel Arc GPU
 
-> 如果使用下面的docker-compose,请在mt-photos中把人脸识别,cli和ocr的并发全部改成8
+> 如果使用下面的 docker-compose，建议先在 mt-photos 中把人脸识别、CLIP 和 OCR 并发设置为 1-2，再按机器资源逐步上调。
 
 ## 最近更新
 
@@ -27,20 +27,32 @@
 | :------------------ | :---------------------------------------------------------------------------- | :--------------------- |
 | `API_AUTH_KEY`    | 用于访问API的认证密钥。                                                       | `mt_photos_ai_extra` |
 | `WEB_CONCURRENCY` | Uvicorn服务启动的工作进程数，一般保持为 1，需要更高吞吐且不依赖休眠时再调大。 | `1`                  |
-| `OCR_WORKERS`     | OCR 线程池大小，同时也是每个工作进程为OCR创建的推理请求数量。                 | `8`                  |
-| `CLIP_WORKERS`    | CLIP 图像/文本共用的线程池与推理请求数量。                                    | `8`                  |
-| `FACE_WORKERS`    | 人脸识别线程池大小，同时决定要预创建的 `FaceAnalysis` 实例数。              | `8`                  |
+| `OCR_WORKERS`     | OCR 线程池大小。                                                               | `2`                  |
+| `CLIP_WORKERS`    | CLIP 图像/文本共用线程池大小。                                                | `2`                  |
+| `FACE_WORKERS`    | 人脸识别线程池大小，同时决定要预创建的 `FaceAnalysis` 实例数。              | `1`                  |
+| `OCR_DET_INFER_REQUESTS` | OCR 检测模型推理请求池大小。                                           | `2`                  |
+| `OCR_REC_INFER_REQUESTS` | OCR 识别模型推理请求池大小。                                           | `2`                  |
+| `CLIP_IMG_INFER_REQUESTS` | CLIP 图像模型推理请求池大小。                                          | `2`                  |
+| `CLIP_TXT_INFER_REQUESTS` | CLIP 文本模型推理请求池大小。                                          | `2`                  |
+| `OCR_PERFORMANCE_HINT` | OCR OpenVINO 性能模式（如 `LATENCY` / `THROUGHPUT`）。                     | `LATENCY`            |
+| `CLIP_PERFORMANCE_HINT` | CLIP OpenVINO 性能模式（如 `LATENCY` / `THROUGHPUT`）。                   | `LATENCY`            |
 | `HTTP_PORT`       | 容器内服务监听的端口号。                                                      | `8060`               |
 
 ### 并发配置建议
 
-如果你只需要稳定的 8 路并发并且希望长时间闲置后也不会出现多进程重启的端口冲突，推荐设置：
+如果你优先希望降低内存占用（推荐先这样起步），建议设置：
 
 ```bash
 - WEB_CONCURRENCY=1
-- OCR_WORKERS=8
-- CLIP_WORKERS=8
-- FACE_WORKERS=8
+- OCR_WORKERS=2
+- CLIP_WORKERS=2
+- FACE_WORKERS=1
+- OCR_DET_INFER_REQUESTS=2
+- OCR_REC_INFER_REQUESTS=2
+- CLIP_IMG_INFER_REQUESTS=2
+- CLIP_TXT_INFER_REQUESTS=2
+- OCR_PERFORMANCE_HINT=LATENCY
+- CLIP_PERFORMANCE_HINT=LATENCY
 ```
 
 只有在需要更高吞吐并能接受额外显存/内存占用时，再考虑把 `WEB_CONCURRENCY` 拉高(会破坏休眠)。
@@ -90,6 +102,16 @@ services:
       - "/dev/dri:/dev/dri"
     environment:
       - API_AUTH_KEY=your_secret_key_here
+      - WEB_CONCURRENCY=1
+      - OCR_WORKERS=2
+      - CLIP_WORKERS=2
+      - FACE_WORKERS=1
+      - OCR_DET_INFER_REQUESTS=2
+      - OCR_REC_INFER_REQUESTS=2
+      - CLIP_IMG_INFER_REQUESTS=2
+      - CLIP_TXT_INFER_REQUESTS=2
+      - OCR_PERFORMANCE_HINT=LATENCY
+      - CLIP_PERFORMANCE_HINT=LATENCY
     restart: unless-stopped
 ```
 
@@ -126,6 +148,16 @@ INFO:     Uvicorn running on http://0.0.0.0:8060 (Press CTRL+C to quit)
 >      - "/dev/dri:/dev/dri"
 >    environment:
 >      - API_AUTH_KEY=your_secret_key_here
+>      - WEB_CONCURRENCY=1
+>      - OCR_WORKERS=2
+>      - CLIP_WORKERS=2
+>      - FACE_WORKERS=1
+>      - OCR_DET_INFER_REQUESTS=2
+>      - OCR_REC_INFER_REQUESTS=2
+>      - CLIP_IMG_INFER_REQUESTS=2
+>      - CLIP_TXT_INFER_REQUESTS=2
+>      - OCR_PERFORMANCE_HINT=LATENCY
+>      - CLIP_PERFORMANCE_HINT=LATENCY
 >    restart: unless-stopped
 > ```
 

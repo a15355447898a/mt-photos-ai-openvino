@@ -71,19 +71,29 @@ det_request_pool = None
 rec_request_pool = None
 postprocess_op = None
 
+def _env_int(name, default, minimum=1):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
 def _get_ocr_compile_config():
     try:
         precision_hint = ov.properties.hint.inference_precision
     except AttributeError:
         precision_hint = "INFERENCE_PRECISION_HINT"
-    return {precision_hint: ov.Type.f32}
+    performance_hint = os.getenv("OCR_PERFORMANCE_HINT", "LATENCY").upper()
+    return {precision_hint: ov.Type.f32, "PERFORMANCE_HINT": performance_hint}
 
 # Thread pool settings
-clip_workers = max(1, int(os.getenv("CLIP_WORKERS", "8")))
-ocr_workers = int(os.getenv("OCR_WORKERS", "8"))
-face_workers = max(1, int(os.getenv("FACE_WORKERS", "8")))
-clip_img_infer_requests = clip_workers
-clip_txt_infer_requests = clip_workers
+clip_workers = _env_int("CLIP_WORKERS", 2)
+ocr_workers = _env_int("OCR_WORKERS", 2)
+face_workers = _env_int("FACE_WORKERS", 1)
+clip_img_infer_requests = _env_int("CLIP_IMG_INFER_REQUESTS", min(clip_workers, 2))
+clip_txt_infer_requests = _env_int("CLIP_TXT_INFER_REQUESTS", min(clip_workers, 2))
+ocr_det_infer_requests = _env_int("OCR_DET_INFER_REQUESTS", min(ocr_workers, 2))
+ocr_rec_infer_requests = _env_int("OCR_REC_INFER_REQUESTS", min(ocr_workers, 2))
 
 ocr_executor = ThreadPoolExecutor(max_workers=ocr_workers)
 clip_executor = ThreadPoolExecutor(max_workers=clip_workers)
@@ -124,8 +134,8 @@ def load_ocr_model():
         det_compiled_model = ov_core.compile_model(det_model, device_name=ocr_device, config=compile_config)
 
         # Create a pool of inference requests for the detection model
-        det_request_pool = Queue(maxsize=ocr_workers)
-        for _ in range(ocr_workers):
+        det_request_pool = Queue(maxsize=ocr_det_infer_requests)
+        for _ in range(ocr_det_infer_requests):
             det_request_pool.put(det_compiled_model.create_infer_request())
 
         # Text recognition model (static width)
@@ -135,8 +145,8 @@ def load_ocr_model():
         rec_compiled_model = ov_core.compile_model(rec_model, device_name=ocr_device, config=compile_config)
 
         # Create a pool of inference requests for the recognition model
-        rec_request_pool = Queue(maxsize=ocr_workers)
-        for _ in range(ocr_workers):
+        rec_request_pool = Queue(maxsize=ocr_rec_infer_requests)
+        for _ in range(ocr_rec_infer_requests):
             rec_request_pool.put(rec_compiled_model.create_infer_request())
 
         # Post-processing operator
@@ -181,6 +191,15 @@ def load_face_model():
 
 @app.on_event("startup")
 async def startup_event():
+    print(
+        "[INFO] Runtime config: "
+        f"WEB_CONCURRENCY={web_concurrency}, "
+        f"OCR_WORKERS={ocr_workers}, CLIP_WORKERS={clip_workers}, FACE_WORKERS={face_workers}, "
+        f"OCR_DET_INFER_REQUESTS={ocr_det_infer_requests}, OCR_REC_INFER_REQUESTS={ocr_rec_infer_requests}, "
+        f"CLIP_IMG_INFER_REQUESTS={clip_img_infer_requests}, CLIP_TXT_INFER_REQUESTS={clip_txt_infer_requests}, "
+        f"OCR_PERFORMANCE_HINT={os.getenv('OCR_PERFORMANCE_HINT', 'LATENCY').upper()}, "
+        f"CLIP_PERFORMANCE_HINT={os.getenv('CLIP_PERFORMANCE_HINT', 'LATENCY').upper()}"
+    )
     # Load models on startup to avoid cold starts on first request
     load_face_model()
     load_clip_img_model()

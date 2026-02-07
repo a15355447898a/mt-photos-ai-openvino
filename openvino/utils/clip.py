@@ -20,6 +20,8 @@ img_onnx_model_path = join_path(model_folder_path, "vit-b-16.img.fp32.onnx")
 txt_onnx_model_path = join_path(model_folder_path, "vit-b-16.txt.fp32.onnx")
 
 IMG_SIZE = 224
+CLIP_DEVICE = os.getenv("CLIP_DEVICE", "GPU")
+CLIP_PERFORMANCE_HINT = os.getenv("CLIP_PERFORMANCE_HINT", "LATENCY").upper()
 
 _tokenizer = bert.FullTokenizer()
 mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
@@ -78,7 +80,9 @@ def load_img_model():
     core = Core()
     model_onnx = core.read_model(img_onnx_model_path)
     return core.compile_model(
-        model=model_onnx, device_name="GPU", config={"PERFORMANCE_HINT": "THROUGHPUT"}
+        model=model_onnx,
+        device_name=CLIP_DEVICE,
+        config={"PERFORMANCE_HINT": CLIP_PERFORMANCE_HINT},
     )
 
 def process_image(img, img_model, infer_request=None):
@@ -94,7 +98,9 @@ def load_txt_model():
     core = Core()
     model_onnx = core.read_model(txt_onnx_model_path)
     return core.compile_model(
-        model=model_onnx, device_name="GPU", config={"PERFORMANCE_HINT": "THROUGHPUT"}
+        model=model_onnx,
+        device_name=CLIP_DEVICE,
+        config={"PERFORMANCE_HINT": CLIP_PERFORMANCE_HINT},
     )
 
 
